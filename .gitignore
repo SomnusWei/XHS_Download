@@ -18,6 +18,7 @@ settings.json
 build/
 dist/
 *.spec.old
+XHSCollector-v*.zip
 
 # 内部开发交接文档（如需公开再手动加回）
 开发.md
