@@ -13,8 +13,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog, QGroupBox,
@@ -25,12 +25,15 @@ from PySide6.QtWidgets import (
 
 from xhs_app import config
 from xhs_app.embed import EngineView
-from xhs_app.models import fmt_like
+from xhs_app.models import AppError, fmt_like
 from xhs_app.queue import (
     CANCELLED, DONE, FAILED, QUEUED, RUNNING, SKIPPED,
     TaskItem, load_tasks, save_tasks,
 )
-from xhs_app.service import DownloadQueue, capture_job, cookie_header_from_dp
+from xhs_app.service import (
+    DownloadQueue, capture_job, cookie_header_from_dp, note_id_from_url,
+    single_note_from_current,
+)
 
 THUMB = 56
 KIND_COLOR = {"图文": QColor(23, 158, 82), "视频": QColor(255, 92, 30)}
@@ -45,7 +48,7 @@ class JobBridge(QObject):
 
 
 class LoginProbe(QObject):
-    """登录态检测结果（工作线程 -> UI）"""
+    """登录态探测结果（工作线程 -> 主线程）"""
     result = Signal(bool)
 
 
@@ -94,6 +97,56 @@ class ThumbFetcher(QObject):
         self._pump()
 
 
+class HoverFetcher(QObject):
+    """封面悬停大图：按需低并发下载原预览图（不经 56px 缩略，便于放大查看）"""
+    loaded = Signal(str, QPixmap)
+    MAX_CONCURRENT = 2
+    MAX_SIDE = 900  # 解码后最长边上限，避免超大原图占内存
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._nam = QNetworkAccessManager(self)
+        self._nam.finished.connect(self._on_finish)
+        self._inflight = {}
+        self._queue = []
+        self._seen = set()
+        self._busy = 0
+
+    def get(self, note_id: str, url: str):
+        if not url or note_id in self._seen:
+            return
+        self._seen.add(note_id)
+        self._queue.append((note_id, url))
+        self._pump()
+
+    def _pump(self):
+        while self._busy < self.MAX_CONCURRENT and self._queue:
+            note_id, url = self._queue.pop(0)
+            req = QNetworkRequest(QUrl(url))
+            req.setRawHeader(b"Referer", b"https://www.xiaohongshu.com/")
+            req.setRawHeader(b"User-Agent", b"Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            reply = self._nam.get(req)
+            self._inflight[reply] = note_id
+            self._busy += 1
+
+    def _on_finish(self, reply: QNetworkReply):
+        note_id = self._inflight.pop(reply, None)
+        if note_id:
+            self._seen.discard(note_id)
+            if reply.error() == QNetworkReply.NoError:
+                pm = QPixmap()
+                if pm.loadFromData(reply.readAll()) and not pm.isNull():
+                    side = max(pm.width(), pm.height())
+                    if side > self.MAX_SIDE:
+                        pm = pm.scaled(
+                            self.MAX_SIDE, self.MAX_SIDE, Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation)
+                    self.loaded.emit(note_id, pm)
+        reply.deleteLater()
+        self._busy = max(0, self._busy - 1)
+        self._pump()
+
+
 class QueueBridge(QObject):
     """下载队列 worker 线程 -> UI 信号桥（DownloadQueue 的 sink）"""
     task_state = Signal(object, str, str)   # (TaskItem, state, msg)
@@ -108,6 +161,12 @@ class QueueBridge(QObject):
 
     def log(self, msg):
         self.sig_log.emit(msg)
+
+
+class SingleBridge(QObject):
+    """单篇笔记下载 worker -> UI 信号桥"""
+    result = Signal(object, object, str)   # (ProfileMeta|None, NoteItem|None, err)
+    log = Signal(str)
 
 
 class HistoryDialog(QDialog):
@@ -185,11 +244,21 @@ class MainWindow(QMainWindow):
         self._meta = None
         self._target_dir = ""
         self._suppress = False
-        self._probe = LoginProbe()
-        self._probe.result.connect(self._on_login_probe)
+        self._logged_in = None       # 最近一次登录态探测结果
         self._checking_login = False
+        self._probe = LoginProbe(self)
+        self._probe.result.connect(self._on_login_state)
         self._thumbs = ThumbFetcher(self)
         self._thumbs.loaded.connect(self._on_thumb)
+        self._hover = HoverFetcher(self)
+        self._hover.loaded.connect(self._on_hover_pix)
+        self._hover_cache = {}          # note_id -> QPixmap（悬停大图缓存，小容量）
+        self._hover_order = []
+        self._hover_note = None         # 当前悬停行对应的 note_id
+        # ---- 单篇笔记下载（读取当前页 SSR，解析后加入队列） ----
+        self._single = SingleBridge(self)
+        self._single.result.connect(self._on_single_note_result)
+        self._single.log.connect(self._log)
         # ---- 下载任务队列（HTTP 通道，不占用可见浏览器） ----
         self._tasks = load_tasks()
         self._qbridge = QueueBridge(self)
@@ -209,7 +278,7 @@ class MainWindow(QMainWindow):
         # ---- 左侧：内嵌浏览器 ----
         self.engine = EngineView(central)
         central.addWidget(self.engine)
-        self.engine.urlChanged.connect(lambda _u: QTimer.singleShot(6000, self._check_login))
+        self.engine.urlChanged.connect(self._schedule_login_check)
 
         # ---- 右侧：操作与数据区 ----
         right = QWidget()
@@ -217,7 +286,7 @@ class MainWindow(QMainWindow):
         rlay.setContentsMargins(6, 6, 6, 6)
 
         hint = QLabel("抓取：输入小红书号 / 主页链接 后点「抓取」；输入为空则抓取左侧当前作者主页。"
-                      "登录 / 验证码请在左侧内嵌浏览器中直接操作。")
+                      "未登录或会话过期时浏览器会自动弹出登录二维码，直接在内嵌浏览器扫码即可。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#888;")
         rlay.addWidget(hint)
@@ -234,21 +303,25 @@ class MainWindow(QMainWindow):
         act = QHBoxLayout()
         self.btn_home = QPushButton("小红书主页")
         self.btn_home.clicked.connect(lambda: self.engine.open_url(config.HOME + "/explore"))
-        self.btn_login = QPushButton("登录/扫码")
-        self.btn_login.clicked.connect(lambda: self.engine.open_url(config.LOGIN_URL))
         self.btn_history = QPushButton("查看记录")
         self.btn_history.setToolTip("查看最近抓取过的用户（用户名 / 小红书号 / 主页链接）")
         self.btn_history.clicked.connect(self._open_history)
         self.btn_opendir = QPushButton("打开目录")
         self.btn_opendir.setToolTip("在文件管理器中打开下载目录")
         self.btn_opendir.clicked.connect(self._open_dir)
+        self.btn_note = QPushButton("下载笔记")
+        self.btn_note.setToolTip("下载左侧当前打开的单篇笔记（图文全部图片 / 视频）")
+        self.btn_note.clicked.connect(self._download_current_note)
+        self.lb_login = QLabel("…")
+        self.lb_login.setStyleSheet("color:#999;")
         self.lb_state = QLabel("")
         self.lb_state.setStyleSheet("color:#1a7f37; font-weight:bold;")
         act.addWidget(self.btn_home)
-        act.addWidget(self.btn_login)
         act.addWidget(self.btn_history)
         act.addWidget(self.btn_opendir)
+        act.addWidget(self.btn_note)
         act.addStretch(1)
+        act.addWidget(self.lb_login)
         act.addWidget(self.lb_state)
         rlay.addLayout(act)
 
@@ -285,8 +358,19 @@ class MainWindow(QMainWindow):
         self.table.setIconSize(QSize(THUMB, THUMB))
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setMouseTracking(True)
         self.table.itemChanged.connect(self._on_table_item_changed)
+        self.table.cellClicked.connect(self._on_row_clicked)
+        self.table.cellEntered.connect(self._on_cell_hover)
+        self.table.viewport().installEventFilter(self)  # 鼠标离开表格时收起悬停大图
         rlay.addWidget(self.table, 1)
+
+        # 悬停封面预览浮窗（跟随鼠标显示大图）
+        self._tip = QLabel(self,
+                           Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self._tip.setStyleSheet(
+            "background:#ffffff; border:1px solid #c9cdd4; padding:4px;")
+        self._tip.hide()
 
         bot = QHBoxLayout()
         self.chk_all = QCheckBox("全选")
@@ -364,6 +448,10 @@ class MainWindow(QMainWindow):
         self._notes.clear()
         self._rows.clear()
         self._row_of.clear()
+        self._hover_note = None
+        self._hover_cache.clear()
+        self._hover_order.clear()
+        self._tip.hide()
         self.table.setRowCount(0)
         self._reset_select_boxes()
         self.btn_get.setEnabled(False)
@@ -378,13 +466,15 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.logbox.appendPlainText(f"[{ts}] {msg}")
 
-    # ---------- 登录态检测 ----------
+    # ---------- 登录态探测（只读，用于状态提示/诊断） ----------
     def showEvent(self, ev):
         super().showEvent(ev)
-        QTimer.singleShot(3000, self._check_login)
+        QTimer.singleShot(2500, self._check_login)
+
+    def _schedule_login_check(self, *_):
+        QTimer.singleShot(6000, self._check_login)
 
     def _check_login(self):
-        """非侵入检测：挂接内嵌引擎读取 web_session cookie，避免打断当前浏览"""
         if self._busy or self._checking_login:
             return
         self._checking_login = True
@@ -406,11 +496,21 @@ class MainWindow(QMainWindow):
             ok = False
         self._probe.result.emit(ok)
 
-    def _on_login_probe(self, ok):
+    def _on_login_state(self, ok):
         self._checking_login = False
-        self.btn_login.setEnabled(not ok)
-        self.btn_login.setToolTip(
-            "登录态有效，无需重复登录" if ok else "打开登录页（登录 / 重新登录）")
+        self.lb_login.setText("● 已登录" if ok else "● 未登录")
+        self.lb_login.setStyleSheet("color:#1a7f37;" if ok else "color:#c77700;")
+        if ok != self._logged_in:
+            self._log("登录态：" + ("已登录" if ok else "未登录/会话过期（内嵌浏览器将自动弹登录二维码）"))
+            if ok:
+                try:
+                    cur = self.engine.url().toString().lower()
+                except Exception:
+                    cur = ""
+                # 扫码成功但还停留在登录页时，跳回首页信息流确认登录
+                if "/login" in cur or not cur:
+                    self.engine.open_url(config.HOME + "/explore")
+        self._logged_in = ok
 
     def _refresh_stats(self):
         img = sum(1 for it in self._rows if not it.is_video)
@@ -533,11 +633,73 @@ class MainWindow(QMainWindow):
             if item:
                 item.setIcon(QIcon(pix))
 
+    # ---------- 行点击勾选 / 封面悬停大图 ----------
+    def _on_row_clicked(self, row, col):
+        """点击整行（复选框列除外）即切换该行勾选"""
+        if self._suppress or col == 0:
+            return
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+
+    def _on_cell_hover(self, row, col):
+        if col != 2:
+            self._hide_tip()
+            return
+        self._show_hover_for(row)
+
+    def _show_hover_for(self, row):
+        item = self.table.item(row, 2)
+        note_id = item.data(Qt.UserRole) if item else None
+        if not note_id:
+            self._hide_tip()
+            return
+        self._hover_note = note_id
+        pix = self._hover_cache.get(note_id)
+        if pix is not None:
+            self._update_tip(pix)
+            return
+        # 未缓存：发起一次大图下载，完成后再弹出
+        note = self._notes.get(note_id)
+        if note and note.cover_url:
+            self._hover.get(note_id, note.cover_url)
+
+    def _update_tip(self, pix):
+        if pix.width() > 520 or pix.height() > 640:
+            pix = pix.scaled(QSize(520, 640), Qt.KeepAspectRatio,
+                             Qt.SmoothTransformation)
+        self._tip.setPixmap(pix)
+        self._tip.adjustSize()
+        p = QCursor.pos()
+        self._tip.move(p.x() + 14, p.y() + 16)
+        self._tip.show()
+
+    def _on_hover_pix(self, note_id, pix):
+        # 小容量缓存（超出淘汰最早项）
+        if note_id not in self._hover_cache:
+            self._hover_cache[note_id] = pix
+            self._hover_order.append(note_id)
+            if len(self._hover_order) > 12:
+                old = self._hover_order.pop(0)
+                self._hover_cache.pop(old, None)
+        if note_id == self._hover_note:
+            self._update_tip(pix)
+
+    def _hide_tip(self):
+        self._hover_note = None
+        self._tip.hide()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.table.viewport() and ev.type() == QEvent.Leave:
+            self._hide_tip()
+        return super().eventFilter(obj, ev)
+
     def _on_done(self, result, err):
         self._busy = False
         self.btn_get.setEnabled(True)
         self.btn_get.setText("抓取")
-        QTimer.singleShot(1600, self._check_login)  # 任务后复检登录态
         if result is None:
             if err == "":
                 self.lb_state.setText("已打开页面")
@@ -672,6 +834,51 @@ class MainWindow(QMainWindow):
             item = self.table.item(r, 5)
             if item:
                 item.setText(text)
+
+    # ---------- 单篇笔记下载（左侧当前笔记页） ----------
+    def _download_current_note(self):
+        """先判断左侧是否在单篇笔记页，是则读取并加入下载队列"""
+        cur_url = self.engine.url().toString()
+        if not note_id_from_url(cur_url):
+            QMessageBox.information(
+                self, "提示",
+                "当前不是单篇笔记页。请先在左侧浏览器打开一篇笔记"
+                "（如 xiaohongshu.com/explore/xxxx…），再点「下载笔记」。")
+            return
+        if not self._target_dir:
+            QMessageBox.information(self, "提示", "请先选择目标目录")
+            self._choose_dir()
+            if not self._target_dir:
+                return
+        self.lb_state.setText("解析当前笔记页…")
+        self._log("正在读取当前笔记页信息…")
+        threading.Thread(target=self._single_note_worker, daemon=True).start()
+
+    def _single_note_worker(self):
+        try:
+            dp = self.engine.attach()
+            meta, note = single_note_from_current(dp)
+            self._single.result.emit(meta, note, "")
+        except AppError as e:
+            self._single.result.emit(None, None, str(e))
+        except Exception as e:
+            self._single.result.emit(
+                None, None, f"内部错误：{type(e).__name__}: {e}")
+
+    def _on_single_note_result(self, meta, note, err):
+        if err or meta is None or note is None:
+            self.lb_state.setText("未开始下载")
+            self._log("单笔记下载未开始：" + err)
+            QMessageBox.information(self, "提示", err)
+            return
+        task = TaskItem(note=note, meta=meta, target_dir=self._target_dir)
+        self._tasks.insert(0, task)
+        save_tasks(self._tasks)
+        title = note.title or note.note_id
+        author = meta.nickname or meta.red_id or meta.user_id or "笔记"
+        self._log(f"单篇笔记已加入下载队列：{author}《{title}》")
+        self._refresh_queue_panel()
+        self._queue.enqueue([task])
 
     def _start_download(self):
         """把勾选作品作为独立任务加入后台队列（可继续浏览/抓取/追加）"""
@@ -813,7 +1020,6 @@ class MainWindow(QMainWindow):
         self.btn_get.setText("抓取")
         self.lb_state.setText(msg)
         self._log("任务结束：" + msg)
-        QTimer.singleShot(1500, self._check_login)
         self._refresh_stats()
 
 

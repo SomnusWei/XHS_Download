@@ -37,6 +37,12 @@ class EngineView(QWebEngineView):
         self._profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
         self._profile.setHttpCacheMaximumSize(512 * 1024 * 1024)
         self._profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+        # 默认 UA 带 QtWebEngine 标识，易被平台判定为自动化而"登录即掉"，
+        # 这里覆盖成普通 Chrome UA 以降低指纹
+        try:
+            self._profile.setHttpUserAgent(config.UA)
+        except Exception:
+            pass
         # 非活动页后台节流会让 XHS 滚动加载变慢/中断，这里禁掉以保抓取稳定
         try:
             self._profile.setBackgroundTimerThrottlingPolicy(

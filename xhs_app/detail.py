@@ -82,6 +82,11 @@ def _find_detail(obj):
     return None
 
 
+def find_note_detail(data):
+    """公开的兜底查找：返回 SSR 数据里第一个含图片/视频的完整笔记对象（含 title/user）"""
+    return _find_detail(data)
+
+
 def detail_from_html(html: str):
     """html -> (kind, urls)。kind: image / video"""
     data = _to_dict(_get_initial_script(html))

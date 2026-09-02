@@ -17,9 +17,11 @@ from curl_cffi import requests as creq
 
 from xhs_app import config
 from xhs_app.collector import fill_meta_from_dom, open_and_collect
-from xhs_app.detail import detail_from_html, fetch_detail
+from xhs_app.detail import (
+    detail_from_html, fetch_detail, find_note_detail, ssr_deep_get, ssr_parse,
+)
 from xhs_app.download import build_target, ext_for, has_existing, remove_prefix
-from xhs_app.models import AppError, LoginRequired, ProfileMeta
+from xhs_app.models import AppError, LoginRequired, NoteItem, ProfileMeta
 from xhs_app.queue import DONE, FAILED, QUEUED, RUNNING, SKIPPED, TaskItem
 from xhs_app.resolver import resolve
 
@@ -230,6 +232,147 @@ def cookie_header_from_dp(dp) -> str:
     except Exception:
         pass
     return "; ".join(parts)
+
+
+def note_id_from_url(url: str):
+    """从链接提取笔记 ID：explore/{id}、discovery/item/{id}、user/profile/{uid}/{id}"""
+    if not url:
+        return None
+    m = re.search(r"/(?:explore|discovery/item)/([0-9A-Za-z]{6,})(?:[/?#]|$)", url)
+    if not m:
+        m = re.search(r"/user/profile/[0-9A-Za-z]+/([0-9A-Za-z]{6,})(?:[/?#]|$)", url)
+    return m.group(1) if m else None
+
+
+def fetch_note_page_html(cookie: str, note_id: str, xsec: str = "") -> str:
+    """HTTP 重取一次笔记页（服务器 SSR 一定含 __INITIAL_STATE__）。
+
+    SPA 客户端跳转打开的笔记页，其当前 DOM 不含 SSR 数据，无法从中取作者，
+    因此统一走一次 GET；登录失效时抛 LoginRequired。
+    """
+    from urllib.parse import quote
+
+    forms = [
+        f"{config.HOME}/explore/{note_id}",
+        f"{config.HOME}/discovery/item/{note_id}",
+    ]
+    cands = []
+    if xsec:
+        for base in forms:
+            cands.append(base + f"?xsec_token={quote(xsec)}&xsec_source=pc_profile")
+    cands.extend(forms)
+    headers = {"Referer": config.HOME + "/", "User-Agent": config.UA, "Cookie": cookie}
+    last = None
+    for url in cands:
+        try:
+            r = creq.get(url, headers=headers, impersonate="chrome", timeout=20)
+            r.raise_for_status()
+            html = r.text or ""
+        except Exception as e:
+            last = e
+            continue
+        if "/login" in (r.url or ""):
+            raise LoginRequired("会话已过期：详情请求被重定向到登录页，需要重新登录")
+        if "__INITIAL_STATE__" in html:
+            return html
+        last = "页面未包含 SSR 数据"
+    raise AppError(f"HTTP 获取笔记页失败（可能需登录或被风控）：{last}")
+
+
+def single_note_from_current(dp, hint_url=""):
+    """由左侧当前笔记页 URL 生成单篇下载任务信息，返回 (ProfileMeta, NoteItem)。
+
+    不依赖当前页 DOM（SPA 跳转的页面没有 SSR），而是用浏览器 Cookie
+    HTTP 重取笔记页 SSR 解析作者/标题/类型。解析分主路径与深度兜底两层。
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    page_url = (dp.url or hint_url or "").strip()
+    note_id = note_id_from_url(page_url)
+    if not note_id:
+        raise AppError(
+            "当前不是单篇笔记页。请先在左侧浏览器打开一篇笔记"
+            "（如 xiaohongshu.com/explore/xxxx…），再点「下载笔记」。")
+    cookie = cookie_header_from_dp(dp)
+    if not cookie:
+        raise AppError("未读到登录 Cookie。若提示未登录，请先在内嵌浏览器扫码登录。")
+    q = parse_qs(urlparse(page_url).query)
+    xsec = (q.get("xsec_token") or [""])[0] or ""
+
+    # SPA 内打开的笔记地址栏常不带 token：从页面上同 id 的 xsec 链接里补一个
+    if not xsec:
+        try:
+            for a in dp.eles(f"css:a[href*='{note_id}'][href*='xsec_token']", timeout=4):
+                href = (a.attr("href") or "") if a else ""
+                if "xsec_token=" in href:
+                    token = parse_qs(urlparse(href).query).get("xsec_token") or [""]
+                    xsec = token[0] or ""
+                    if xsec:
+                        break
+        except Exception:
+            pass
+
+    html = fetch_note_page_html(cookie, note_id, xsec)
+    data = ssr_parse(html)
+    d = ssr_deep_get(data, ["note", "noteDetailMap", "[-1]", "note"]) if data else None
+    if not isinstance(d, dict):
+        # 键位结构变化时：深度扫描第一个含媒体与用户信息的完整笔记对象
+        d = find_note_detail(data) if data else None
+    if not isinstance(d, dict):
+        # 最后手段：让浏览器亲自打开一次直链（带登录态与服务器 SSR）再读 DOM
+        from urllib.parse import quote as _quote
+        navs = []
+        if xsec:
+            navs.append(f"{config.HOME}/explore/{note_id}"
+                        f"?xsec_token={_quote(xsec)}&xsec_source=pc_profile")
+        navs.append(f"{config.HOME}/explore/{note_id}")
+
+        def _pick(obj):
+            dd = ssr_deep_get(obj, ["note", "noteDetailMap", "[-1]", "note"])
+            return dd if isinstance(dd, dict) else find_note_detail(obj)
+
+        for u in navs:
+            try:
+                dp.get(u)
+            except Exception:
+                continue
+            end = time.time() + 12
+            while time.time() < end:
+                try:
+                    h2 = dp.html or ""
+                except Exception:
+                    h2 = ""
+                d = _pick(ssr_parse(h2)) if h2 else None
+                if isinstance(d, dict):
+                    break
+                time.sleep(1)
+            if isinstance(d, dict):
+                break
+    if not isinstance(d, dict):
+        raise AppError(
+            "未能从该笔记页取到详情数据（可能笔记已删除/仅自己可见/权限受限）。"
+            "可尝试复制笔记链接粘贴到输入框后点「抓取」走作者列表流程。")
+
+    user = d.get("user") or {}
+    xsec = xsec or str(d.get("xsec_token") or "")
+    note_type = d.get("type")
+    kind = "video" if (note_type == "video" or d.get("video")) else "normal"
+
+    meta = ProfileMeta(
+        user_id=str(user.get("userId") or ""),
+        href=page_url,
+        nickname=str(user.get("nickname") or user.get("nick_name") or "").strip(),
+        red_id=str(user.get("redId") or user.get("red_id") or "").strip(),
+    )
+    note = NoteItem(
+        note_id=note_id,
+        kind=kind,
+        title=(d.get("title") or "").strip(),
+        cover_url="",
+        liked=0,
+        xsec_token=xsec,
+    )
+    return meta, note
 
 
 def fetch_detail_http(cookie: str, note):

@@ -16,6 +16,15 @@ from xhs_app.models import (
     AppError, CollectResult, LoginRequired, parse_note, parse_notes_body,
 )
 
+# 自适应滚动节奏（“催滚动 + 短轮询”）：单次大步长；有产出微提速、连续无产出退避
+_SCROLL_STEP = 2400      # 每次滚动像素（实测大步长最稳）
+_DRAIN_T = 0.35          # 每次收包等待上限（秒）
+_DELAY_INIT = 1.1        # 初始间隔
+_DELAY_MIN = 0.6         # 最短间隔（有产出时可加快）
+_DELAY_MAX = 2.6         # 最长间隔（连续无产出时退避，防风控）
+_DELAY_UP = 1.35         # 无产出退避倍率
+_DELAY_DOWN = 0.9        # 有产出提速倍率
+
 
 def notes_from_profile_ssr(tab):
     """小作者主页由 SSR 直接渲染（不发 user_posted）→ 从 __INITIAL_STATE__.user.notes 兜底解析"""
@@ -121,31 +130,37 @@ def collect(tab, meta, log=None, on_batch=None) -> CollectResult:
                 log(f"  页面 SSR 渲染 {len(ssr_notes)} 篇（无网络分页请求），采用 SSR 列表")
 
     if not ssr_mode:
+        # 自适应滚动节奏：有产出适当提速、连续无产出退避（探针经验：
+        # 单次大步长最稳，过频的小步滚动反而易被风控提前 has_more=false）
+        delay = _DELAY_INIT
         for _ in range(config.SCROLL_ROUNDS):
             if len(notes) >= config.MAX_NOTES:
                 break
             try:
-                tab.scroll.down(2400)
+                tab.scroll.down(_SCROLL_STEP)
             except Exception:
                 pass
-            time.sleep(1.6)
+            time.sleep(delay)
             got_any = False
-            for p in _drain(tab, timeout=0.7):
+            for p in _drain(tab, timeout=_DRAIN_T):
                 try:
                     got_any = handle_body(p.response.body) or got_any
                 except Exception:
                     pass
-            if not got_any:
+            if got_any:
+                empty_rounds = 0
+                delay = max(_DELAY_MIN, delay * _DELAY_DOWN)   # 有产出→快
+            else:
                 empty_rounds += 1
+                delay = min(_DELAY_MAX, delay * _DELAY_UP)     # 无产出→退避
                 if empty_rounds >= config.EMPTY_STOP:
                     break
-
         # 兜底：直接到底再收一轮
         try:
             tab.scroll.to_bottom()
         except Exception:
             pass
-        time.sleep(1.2)
+        time.sleep(max(0.8, min(1.6, delay)))
         for p in _drain(tab, timeout=0.8):
             try:
                 handle_body(p.response.body)
