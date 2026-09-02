@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# 本地数据 / 凭据（严禁提交）
+user_data/
+user_data_qt/
+.cache/
+github推送相关.txt
+
+# 本地配置（含个人下载目录）
+.settings.json
+settings.json
+
+# 构建产物
+build/
+dist/
+*.spec.old
+
+# 内部开发交接文档（如需公开再手动加回）
+开发.md

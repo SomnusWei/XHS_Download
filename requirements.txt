@@ -1,0 +1,6 @@
+PySide6==6.11.2
+DrissionPage==4.1.1.4
+curl_cffi>=0.16
+PyYAML>=6.0
+httpx>=0.28
+requests>=2.32
