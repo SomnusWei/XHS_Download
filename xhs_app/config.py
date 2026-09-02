@@ -34,6 +34,10 @@ LOGIN_URL = HOME + "/login"                        # 登录页（扫码）
 HIDDEN = True                                      # 预留：旧 Edge 离屏模式（当前已改内嵌，保留兼容开关）
 DEBUG_PORT = 9333                                   # CDP 调试端口（旧 Edge 模式）
 QT_CDP_PORT = 9347                                  # QtWebEngine 内嵌引擎 CDP 端口
+HISTORY_FILE = DATA_DIR / "history.json"            # 抓取历史（用户名/小红书号/主页链接）
+HISTORY_MAX = 300                                   # 历史记录条数上限
+TASKS_FILE = DATA_DIR / "tasks.json"                # 下载任务队列（断点/本地持久化）
+TASKS_MAX = 1000                                    # 队列保留上限
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 USER_POSTED = "user_posted"                        # 列表接口监听关键字

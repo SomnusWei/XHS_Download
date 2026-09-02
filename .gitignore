@@ -9,6 +9,9 @@ user_data/
 user_data_qt/
 .cache/
 github推送相关.txt
+# 运行时生成（含个人抓取记录与含 token 的链接）
+history.json
+tasks.json
 
 # 本地配置（含个人下载目录）
 .settings.json

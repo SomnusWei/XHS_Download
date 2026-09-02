@@ -14,8 +14,12 @@ import time
 
 from xhs_app import config
 
+# GPU 默认启用（硬件合成）。早期为稳妥加过 --disable-gpu，代价是整页变
+# 软件渲染、滚动/动效卡顿；现代 Edge/GPU 驱动下默认即可，异常时再由
+# config.CHROMIUM_FLAGS 覆盖关掉。
 os.environ.setdefault("QTWEBENGINE_REMOTE_DEBUGGING", str(config.QT_CDP_PORT))
-os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--remote-allow-origins=* --disable-gpu")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                      getattr(config, "CHROMIUM_FLAGS", "--remote-allow-origins=*"))
 
 from PySide6.QtCore import QUrl  # noqa: E402
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile  # noqa: E402
@@ -30,7 +34,15 @@ class EngineView(QWebEngineView):
         self._profile = QWebEngineProfile("xhs_main")
         self._profile.setPersistentStoragePath(str(config.QT_PROFILE))
         self._profile.setCachePath(str(config.QT_PROFILE / "cache"))
+        self._profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
+        self._profile.setHttpCacheMaximumSize(512 * 1024 * 1024)
         self._profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+        # 非活动页后台节流会让 XHS 滚动加载变慢/中断，这里禁掉以保抓取稳定
+        try:
+            self._profile.setBackgroundTimerThrottlingPolicy(
+                QWebEngineProfile.DisallowTimerThrottlingForBackgroundPages)
+        except Exception:
+            pass
         page = QWebEnginePage(self._profile, self)
         # 小红书大量卡片用 target=_blank/新窗口跳转；单窗口体验改为在当前视图内打开
         page.newWindowRequested.connect(self._on_new_window)

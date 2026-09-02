@@ -56,18 +56,60 @@ def find_user_card(page, kw: str, log=None):
     return None
 
 
+def _looks_like_profile(page, kw: str) -> bool:
+    """判断当前页是否为 kw 对应作者的已打开主页（非登录墙）"""
+    try:
+        if "/login" in (page.url or "").lower():
+            return False
+        html = page.html or ""
+    except Exception:
+        return False
+    if not html:
+        return False
+    # 主页 SSR/正文含“小红书号：kw”，标题含“的主页”也佐证
+    if f"小红书号：{kw}" in html or f"小红书号:{kw}" in html:
+        return True
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    return bool(m and kw in m.group(1))
+
+
 def resolve_by_number(page, kw: str, log=None) -> str:
-    """通过站内搜索解析数字小红书号 -> 带 xsec_token 的主页链接"""
+    """通过站内搜索解析数字小红书号 -> 带 xsec_token 的主页链接
+
+    兜底链：搜索(重试) → 直开主页尝试 → 仍失败给指引。
+    """
+    direct = f"{HOME}/user/profile/{kw}"
+
+    def _search_once():
+        if log:
+            log(f"站内搜索小红书号 {kw} …")
+        page.get(f"{HOME}/search_result?keyword={kw}&source=web_explore_feed")
+        _wait_load(page, 6)
+        if "/login" in (page.url or "").lower():
+            raise LoginRequired("会话已过期：被重定向到登录页，需要重新扫码登录")
+        return find_user_card(page, kw, log)
+
+    # 第 1 次搜索
+    href = _search_once()
+    # 第 2 次：搜索页用户卡片常是懒加载，间隔后刷新再找一次
+    if not href:
+        time.sleep(3)
+        href = _search_once()
+    if href:
+        return href if href.startswith("http") else HOME + href
+
+    # 兜底：直开主页（已登录时通常可正常渲染，缺 xsec_token 也仅在未登录时才弹登录墙）
     if log:
-        log(f"站内搜索小红书号 {kw} …")
-    page.get(f"{HOME}/search_result?keyword={kw}&source=web_explore_feed")
-    _wait_load(page, 6)
+        log("搜索未命中，尝试直接打开主页…")
+    page.get(direct)
+    _wait_load(page, 5)
     if "/login" in (page.url or "").lower():
         raise LoginRequired("会话已过期：被重定向到登录页，需要重新扫码登录")
-    href = find_user_card(page, kw, log)
-    if not href:
-        raise AppError(f"未找到小红书号为 {kw} 的用户。可改为粘贴该用户主页链接（从浏览器复制，含 xsec_token）。")
-    return href if href.startswith("http") else HOME + href
+    if _looks_like_profile(page, kw):
+        return direct
+
+    raise AppError(
+        f"未找到小红书号为 {kw} 的用户。可改为粘贴该用户主页链接（从浏览器复制，含 xsec_token）。")
 
 
 def resolve(page, raw: str, log=None) -> ProfileMeta:
